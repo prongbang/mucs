@@ -2,9 +2,6 @@ services:
   mucs:
     build: .
     container_name: mucs-service
-    depends_on:
-      rustfs:
-        condition: service_healthy
     ports:
       - "18080:8080"
     environment:
