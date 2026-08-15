@@ -5,3 +5,7 @@ web/build
 web/.svelte-kit
 .git
 .DS_Store
+
+# Credentials reach the container through compose's env_file, not the image —
+# no reason to hand them to the build daemon.
+.env
