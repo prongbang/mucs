@@ -33,9 +33,18 @@ peak RAM. Serialise, don't parallelise.
 ## Running
 
 ```bash
-cp .env.example .env
+cp .env.example .env      # credentials and demucs tuning; not tracked
 docker compose up --build
 ```
+
+`.env` holds nothing container-specific, so the same file also configures
+`cargo run` on a host. Container paths (`DATABASE_URL`, `WORK_DIR`, …) stay in
+`docker-compose.yml`.
+
+The image builds on both amd64 and arm64. arm64 costs an extra minute: demucs
+depends on sphn, which publishes linux wheels for x86_64 only, so on arm64 it
+compiles from source and the Dockerfile installs a toolchain for that step
+alone.
 
 RustFS console: http://localhost:9001 (`rustfsadmin` / `rustfsadmin`)
 

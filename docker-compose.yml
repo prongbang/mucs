@@ -4,25 +4,14 @@ services:
     container_name: mucs-service
     ports:
       - "18080:8080"
+    # Credentials and tuning live here, untracked. See .env.example.
+    env_file: .env
     environment:
-      # Container-side port, which is the right-hand side of the mapping above.
+      # Only the container's own topology stays in this file, so .env can be
+      # copied to a host running `cargo run` without dragging /data along.
       BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: sqlite:///data/jobs.db?mode=rwc
       WORK_DIR: /data/work
-
-      S3_ENDPOINT: REDACTED
-      S3_BUCKET: mucs
-      S3_ACCESS_KEY: REDACTED
-      S3_SECRET_KEY: REDACTED
-      S3_REGION: us-east-1
-      PRESIGN_SECS: "900"
-
-      DEMUCS_MODEL: htdemucs
-      DEMUCS_JOBS: "1"
-      DEMUCS_SEGMENT: "7"
-      DEMUCS_THREADS: "4"
-      DEMUCS_FORMAT: mp3
-      JOB_TIMEOUT_SECS: "3600"
       # Cache the ~300MB model weights so they survive a container restart.
       TORCH_HOME: /data/torch
     volumes:

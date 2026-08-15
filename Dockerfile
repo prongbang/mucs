@@ -24,30 +24,37 @@ RUN touch src/main.rs && cargo build --release
 FROM python:3.11-slim-bookworm
 WORKDIR /app
 
+# libgomp1 is torch's, not a build dependency — it lives here so the toolchain
+# teardown below can't take it along.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl && \
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 # CPU-only torch keeps the image around 1GB instead of 6GB+.
 #
-# demucs 4.1 depends on sphn, which publishes linux wheels for x86_64 only — on
-# arm64 pip falls back to the sdist, and that's a pyo3 crate. Its build script
-# fetches its own Rust toolchain but not a C linker, so `cc` has to be here.
-# libgomp1 is pulled in by name because torch needs it at runtime and it would
-# otherwise leave with build-essential on the autoremove.
+# demucs 4.1 depends on sphn, which publishes linux wheels for x86_64 only. On
+# every other arch pip falls back to the sdist, and that's a pyo3 crate: its
+# build script fetches its own Rust toolchain but not a C linker, and it
+# vendors libopus through cmake, where pip's build-isolated CMake 4 rejects the
+# pre-3.5 policies libopus still declares. So arm64 needs a compiler for one
+# package, and gets it only for as long as that package takes to build.
 #
-# sphn vendors libopus and builds it through the cmake crate. pip's build
-# isolation supplies CMake 4, which dropped support for the pre-3.5 policies
-# that libopus' CMakeLists still declares — this is the escape hatch CMake's
-# own error message names. Harmless on x86_64, where the wheel is used instead.
-ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential libgomp1 && \
-    pip install --no-cache-dir \
-        torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir "demucs==4.1.0" lameenc numpy && \
-    apt-get purge -y build-essential && \
-    apt-get autoremove -y && \
+# TARGETARCH comes from BuildKit. If some older builder leaves it empty the
+# test falls to the toolchain side, which is the harmless direction — a slower
+# build rather than a broken one.
+ARG TARGETARCH
+RUN set -eux; \
+    if [ "$TARGETARCH" != "amd64" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends build-essential; \
+    fi; \
+    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu; \
+    CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        pip install --no-cache-dir "demucs==4.1.0" lameenc numpy; \
+    if [ "$TARGETARCH" != "amd64" ]; then \
+        apt-get purge -y build-essential; \
+        apt-get autoremove -y; \
+    fi; \
     rm -rf /var/lib/apt/lists/* /root/.cache/puccinialin /root/.cargo
 
 COPY --from=builder /build/target/release/demucs-service /usr/local/bin/demucs-service
