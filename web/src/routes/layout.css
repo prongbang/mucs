@@ -1,0 +1,47 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/typography';
+
+@theme {
+	--color-ink-950: #08090b;
+	--color-ink-900: #0c0e11;
+	--color-ink-850: #101317;
+	--color-ink-800: #161a20;
+	--color-ink-700: #222831;
+	--color-ink-600: #323a46;
+	--color-ink-400: #6d7785;
+	--color-ink-200: #a7b1be;
+	--color-ink-50: #e9edf2;
+
+	--color-accent: #f5a524;
+
+	--font-sans:
+		ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'IBM Plex Sans Thai', 'Noto Sans Thai',
+		sans-serif;
+	--font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+}
+
+@layer base {
+	html {
+		color-scheme: dark;
+	}
+
+	body {
+		background:
+			radial-gradient(70rem 40rem at 50% -20rem, color-mix(in oklab, var(--color-accent) 9%, transparent), transparent),
+			var(--color-ink-950);
+		color: var(--color-ink-50);
+		font-family: var(--font-sans);
+		-webkit-font-smoothing: antialiased;
+		min-height: 100dvh;
+	}
+
+	/* Numbers in the job list change every poll — fixed-width digits stop the
+	   rows from twitching. */
+	:where(time, .tnum) {
+		font-variant-numeric: tabular-nums;
+	}
+
+	::selection {
+		background: color-mix(in oklab, var(--color-accent) 35%, transparent);
+	}
+}

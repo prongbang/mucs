@@ -1,0 +1,40 @@
+[package]
+name = "demucs-service"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[dependencies]
+axum = { version = "0.8", features = ["multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
+
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio", "sqlite", "macros", "migrate",
+] }
+
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+tempfile = "3"
+regex = "1"
+mime_guess = "2"
+# Bakes web/build into the binary in release; reads it off disk in debug builds,
+# so `bun run dev` stays the loop for working on the console.
+rust-embed = "8"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

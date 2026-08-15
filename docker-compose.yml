@@ -1,0 +1,40 @@
+services:
+  mucs:
+    build: .
+    container_name: mucs-service
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    ports:
+      - "18080:8080"
+    environment:
+      BIND_ADDR: 0.0.0.0:18080
+      DATABASE_URL: sqlite:///data/jobs.db?mode=rwc
+      WORK_DIR: /data/work
+
+      S3_ENDPOINT: REDACTED
+      S3_BUCKET: mucs
+      S3_ACCESS_KEY: REDACTED
+      S3_SECRET_KEY: REDACTED
+      S3_REGION: us-east-1
+      PRESIGN_SECS: "900"
+
+      DEMUCS_MODEL: htdemucs
+      DEMUCS_JOBS: "1"
+      DEMUCS_SEGMENT: "7"
+      DEMUCS_THREADS: "4"
+      DEMUCS_FORMAT: mp3
+      JOB_TIMEOUT_SECS: "3600"
+      # Cache the ~300MB model weights so they survive a container restart.
+      TORCH_HOME: /data/torch
+    volumes:
+      - mucs-data:/data
+    # 4 cores, and htdemucs wants headroom for the FFT buffers.
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4g
+
+volumes:
+  mucs-data:
