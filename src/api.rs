@@ -1,17 +1,19 @@
 use std::sync::Arc;
 
-use axum::extract::{Multipart, Path as AxPath, Query, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{Multipart, Path as AxPath, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use lazynton::E2ee;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
 use crate::config::Config;
-use crate::db::{Job, Stem, Store, STATUS_DONE};
+use crate::db::{Job, ListQuery, Stem, Store, STATUS_DONE};
 use crate::error::{AppError, AppResult};
 use crate::storage::Storage;
 use crate::worker::sanitize;
@@ -25,12 +27,31 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let e2ee = E2ee::new(state.cfg.e2ee_shared_key.clone());
+
+    // lazynton decrypts the request body and encrypts the response, so every
+    // route behind it must carry a body — that's why the reads are POSTs.
+    let encrypted = Router::new()
+        .route("/api/jobs/search", post(list_jobs))
+        .route("/api/jobs/get", post(get_job))
+        .route("/api/audio-key", post(audio_key))
+        .route("/api/jobs/{id}", patch(patch_job).delete(delete_job))
+        .layer(axum::middleware::from_fn_with_state(
+            e2ee.clone(),
+            lazynton::middleware,
+        ))
+        .with_state(state.clone());
+
     Router::new()
+        // Plaintext by necessity: the healthcheck has no client library, the
+        // upload is 256 MB of multipart, and the download is a redirect to
+        // RustFS. The audio on those two paths carries its own encryption.
         .route("/healthz", get(healthz))
-        .route("/api/jobs", post(create_job).get(list_jobs))
-        .route("/api/jobs/{id}", get(get_job).delete(delete_job))
+        .route("/api/jobs", post(create_job))
         .route("/api/jobs/{id}/download/{stem}", get(download_stem))
         .with_state(state)
+        .merge(encrypted)
+        .merge(e2ee.handshake_router("/handshake"))
         // Anything that isn't the API is the console.
         .fallback(crate::web::handler)
 }
@@ -47,6 +68,7 @@ pub struct JobView {
     pub two_stems: Option<String>,
     pub stems: Vec<StemView>,
     pub error: Option<String>,
+    pub favorite: bool,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -85,6 +107,7 @@ impl JobView {
             two_stems: job.two_stems,
             stems: stem_views,
             error: job.error,
+            favorite: job.favorite,
             created_at: job.created_at,
             started_at: job.started_at,
             finished_at: job.finished_at,
@@ -199,38 +222,69 @@ async fn create_job(
     Ok((StatusCode::ACCEPTED, Json(JobView::from(job))))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(default)]
 pub struct ListParams {
     pub status: Option<String>,
+    /// Substring match on the filename.
+    pub q: Option<String>,
+    /// `newest` (default) · `oldest` · `name` · `name_desc`
+    pub sort: Option<String>,
+    pub favorite: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
+/// `POST /api/jobs/search` — a POST because it goes through the E2EE
+/// middleware, which has no encrypted body to read on a GET.
 async fn list_jobs(
     State(st): State<AppState>,
-    Query(p): Query<ListParams>,
+    Json(p): Json<ListParams>,
 ) -> AppResult<Json<serde_json::Value>> {
     let limit = p.limit.unwrap_or(50).clamp(1, 200);
     let offset = p.offset.unwrap_or(0).max(0);
 
-    let jobs = st
+    let (jobs, total) = st
         .store
-        .list(p.status.as_deref(), limit, offset)
+        .list(&ListQuery {
+            status: p.status.as_deref(),
+            search: p.q.as_deref(),
+            favorites_only: p.favorite.unwrap_or(false),
+            sort: p.sort.as_deref().unwrap_or("newest"),
+            limit,
+            offset,
+        })
         .await
         .map_err(AppError::Other)?;
 
     let views: Vec<JobView> = jobs.into_iter().map(JobView::from).collect();
-    Ok(Json(json!({ "jobs": views, "limit": limit, "offset": offset })))
+    Ok(Json(
+        json!({ "jobs": views, "total": total, "limit": limit, "offset": offset }),
+    ))
 }
 
-async fn get_job(State(st): State<AppState>, AxPath(id): AxPath<String>) -> AppResult<Json<JobView>> {
+#[derive(Deserialize)]
+pub struct JobRef {
+    pub id: String,
+}
+
+/// `POST /api/jobs/get` with `{"id": "…"}` — see [`list_jobs`] for why it's a POST.
+async fn get_job(State(st): State<AppState>, Json(r): Json<JobRef>) -> AppResult<Json<JobView>> {
     let job = st
         .store
-        .get(&id)
+        .get(&r.id)
         .await
         .map_err(AppError::Other)?
         .ok_or(AppError::NotFound)?;
     Ok(Json(JobView::from(job)))
+}
+
+/// The audio key, handed out only over the encrypted channel. It is the same
+/// key for every client — the service has to hold it anyway, because demucs
+/// needs plaintext — so this protects the bytes on the wire and inside RustFS,
+/// not from the service itself.
+async fn audio_key(State(st): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({ "key": st.cfg.audio_key, "chunk": crate::crypto::CHUNK }))
 }
 
 /// Hands back a 307 to a presigned RustFS URL so the bytes never transit this
@@ -272,19 +326,82 @@ async fn download_stem(
     let ext = stem.key.rsplit('.').next().unwrap_or("mp3");
     let download_name = format!("{base} - {}.{ext}", stem.name);
 
+    // An encrypted stem has to be decrypted in the browser, and fetching a
+    // presigned URL from JS would need CORS configured on the bucket. Streaming
+    // the ciphertext back through here keeps it same-origin; the plaintext still
+    // never exists on this path.
+    if st.cfg.audio_key.is_some() {
+        let stream = st
+            .storage
+            .get_stream(&stem.key)
+            .await
+            .map_err(AppError::Other)?;
+
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", download_name.replace('"', "")),
+                ),
+            ],
+            Body::from_stream(tokio_util::io::ReaderStream::new(stream.into_async_read())),
+        )
+            .into_response());
+    }
+
     let url = st
         .storage
         .presign_get(&stem.key, &download_name)
         .await
         .map_err(AppError::Other)?;
 
-    Ok(Redirect::temporary(&url))
+    Ok(Redirect::temporary(&url).into_response())
 }
 
+#[derive(Deserialize)]
+pub struct PatchBody {
+    pub filename: Option<String>,
+    pub favorite: Option<bool>,
+}
+
+/// Rename and/or star a job. A rename changes the display name and the
+/// download filename; the stored objects don't move.
+async fn patch_job(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<PatchBody>,
+) -> AppResult<Json<JobView>> {
+    // Same rules as the upload path: this string ends up in a
+    // Content-Disposition header.
+    let filename = match body.filename {
+        Some(f) if f.trim().is_empty() => {
+            return Err(AppError::BadRequest("filename is empty".into()))
+        }
+        Some(f) => Some(sanitize(&f)),
+        None => None,
+    };
+
+    if filename.is_none() && body.favorite.is_none() {
+        return Err(AppError::BadRequest("nothing to update".into()));
+    }
+
+    let job = st
+        .store
+        .patch(&id, filename.as_deref(), body.favorite)
+        .await
+        .map_err(AppError::Other)?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(JobView::from(job)))
+}
+
+/// Returns a JSON body rather than 204: the E2EE middleware encrypts the
+/// response, and a 204 is not allowed to carry one.
 async fn delete_job(
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
-) -> AppResult<StatusCode> {
+) -> AppResult<Json<serde_json::Value>> {
     let removed = st.store.delete(&id).await.map_err(AppError::Other)?;
     if !removed {
         return Err(AppError::BadRequest(
@@ -297,5 +414,5 @@ async fn delete_job(
         .await
         .map_err(AppError::Other)?;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(json!({ "deleted": id })))
 }

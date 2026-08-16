@@ -30,6 +30,35 @@ export const dict = {
 		jobs: 'งาน',
 		loading: 'กำลังโหลด…',
 		empty: 'ยังไม่มีงาน — อัปโหลดเพลงแรกได้เลย',
+		noMatch: 'ไม่พบงานที่ตรงกับที่ค้นหา',
+
+		searchPlaceholder: 'ค้นหาชื่อไฟล์…',
+		sortLabel: 'เรียงตาม',
+		sorts: {
+			newest: 'ใหม่สุดก่อน',
+			oldest: 'เก่าสุดก่อน',
+			name: 'ชื่อ ก–ฮ',
+			name_desc: 'ชื่อ ฮ–ก'
+		},
+		favOnly: 'เฉพาะที่ปักดาว',
+		favoriteAdd: 'ปักดาว',
+		favoriteRemove: 'เอาดาวออก',
+		favoriteAria: (f: string) => `ปักดาวงาน ${f}`,
+		favoriteFailed: 'ปักดาวไม่สำเร็จ',
+
+		renameTitle: 'คลิกเพื่อแก้ชื่อ',
+		renameAria: (f: string) => `แก้ชื่องาน ${f}`,
+		renameFailed: 'เปลี่ยนชื่อไม่สำเร็จ',
+
+		encrypting: 'กำลังเข้ารหัสไฟล์…',
+		encryptFailed: 'เข้ารหัสไฟล์ไม่สำเร็จ — ยังไม่ได้อัปโหลด',
+		decryptFailed: 'ถอดรหัสไฟล์ที่ดาวน์โหลดไม่สำเร็จ',
+		chunkMismatch: 'ขนาด chunk ของ server ไม่ตรงกับ console — ปิดการเข้ารหัสเสียงไว้ก่อน',
+
+		prev: 'ก่อนหน้า',
+		next: 'ถัดไป',
+		range: (a: number, b: number, n: number) => `${a}–${b} จาก ${n}`,
+
 		status: { queued: 'รอคิว', running: 'กำลังแยก', done: 'เสร็จแล้ว', failed: 'ล้มเหลว' },
 		twoStemsTag: '2 ราง',
 		waiting: 'รอ worker ว่าง',
@@ -77,6 +106,35 @@ export const dict = {
 		jobs: 'jobs',
 		loading: 'Loading…',
 		empty: 'No jobs yet — upload your first track',
+		noMatch: 'No jobs match that',
+
+		searchPlaceholder: 'Search filenames…',
+		sortLabel: 'sort by',
+		sorts: {
+			newest: 'Newest first',
+			oldest: 'Oldest first',
+			name: 'Name A–Z',
+			name_desc: 'Name Z–A'
+		},
+		favOnly: 'starred only',
+		favoriteAdd: 'star this job',
+		favoriteRemove: 'remove star',
+		favoriteAria: (f: string) => `star job ${f}`,
+		favoriteFailed: 'could not update the star',
+
+		renameTitle: 'click to rename',
+		renameAria: (f: string) => `rename job ${f}`,
+		renameFailed: 'rename failed',
+
+		encrypting: 'Encrypting…',
+		encryptFailed: "couldn't encrypt the file — nothing was uploaded",
+		decryptFailed: "couldn't decrypt the downloaded stem",
+		chunkMismatch: "the service's chunk size doesn't match this console — audio encryption is off",
+
+		prev: 'Previous',
+		next: 'Next',
+		range: (a: number, b: number, n: number) => `${a}–${b} of ${n}`,
+
 		status: { queued: 'queued', running: 'separating', done: 'done', failed: 'failed' },
 		twoStemsTag: '2 stems',
 		waiting: 'waiting for a free worker',

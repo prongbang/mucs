@@ -8,6 +8,7 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 
 use crate::config::Config;
+use crate::crypto;
 use crate::db::{Job, Stem, Store};
 use crate::storage::Storage;
 
@@ -75,12 +76,34 @@ impl Worker {
         tokio::fs::create_dir_all(&in_dir).await?;
         tokio::fs::create_dir_all(&out_dir).await?;
 
-        // 1. pull the upload back down from RustFS
-        let local_in = in_dir.join(sanitize(&job.filename));
+        // 1. pull the upload back down from RustFS, decrypting it if the client
+        //    sealed it on the way up. The name comes from the input key, not
+        //    from `filename`: that one is a display name the user can rename,
+        //    and demucs still needs the real extension.
+        let original = job
+            .input_key
+            .rsplit('/')
+            .next()
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&job.filename);
+        let local_in = in_dir.join(sanitize(original));
+        let fetched = in_dir.join("object.bin");
         self.storage
-            .get_to_file(&job.input_key, &local_in)
+            .get_to_file(&job.input_key, &fetched)
             .await
             .context("downloading input from storage")?;
+
+        // Objects stored before AUDIO_KEY was configured are plaintext, so go by
+        // what's actually in the file rather than by whether a key is set.
+        match &self.cfg.audio_key {
+            Some(key) if crypto::is_encrypted(&fetched).await => {
+                crypto::decrypt_file(&fetched, &local_in, key)
+                    .await
+                    .context("decrypting the upload")?;
+                let _ = tokio::fs::remove_file(&fetched).await;
+            }
+            _ => tokio::fs::rename(&fetched, &local_in).await?,
+        }
 
         // 2. separate
         self.run_demucs(job, &local_in, &out_dir).await?;
@@ -105,13 +128,33 @@ impl Worker {
                 .to_string();
 
             let key = format!("jobs/{}/output/{}.{}", job.id, name, ext);
-            let bytes = self
+
+            // Seal the stem before it leaves the box, so RustFS only ever holds
+            // ciphertext. The recorded size stays the plaintext one — that's the
+            // number the console shows next to the download.
+            let (upload_from, bytes) = match &self.cfg.audio_key {
+                Some(audio_key) => {
+                    let sealed = path.with_extension(format!("{ext}.enc"));
+                    crypto::encrypt_file(&path, &sealed, audio_key)
+                        .await
+                        .with_context(|| format!("encrypting stem {name}"))?;
+                    let plain_len = tokio::fs::metadata(&path).await?.len() as i64;
+                    (sealed, Some(plain_len))
+                }
+                None => (path.clone(), None),
+            };
+
+            let uploaded = self
                 .storage
-                .put_file(&key, &path)
+                .put_file(&key, &upload_from)
                 .await
                 .with_context(|| format!("uploading stem {name}"))?;
 
-            stems.push(Stem { name, key, bytes });
+            stems.push(Stem {
+                name,
+                key,
+                bytes: bytes.unwrap_or(uploaded),
+            });
         }
 
         stems.sort_by(|a, b| a.name.cmp(&b.name));

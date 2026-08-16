@@ -98,10 +98,20 @@ curl -F file=@song.mp3 http://localhost:8080/api/jobs
 { "id": "3f2a...", "filename": "song.mp3", "status": "queued", "progress": 0, "stems": [] }
 ```
 
+Uploads are multipart and stay outside the encrypted JSON channel — see
+[Encryption](#encryption).
+
 ### Poll
 
-```bash
-curl http://localhost:8080/api/jobs/3f2a...
+Reads are POSTs because they go through the E2EE middleware, which needs a body
+to decrypt. With `E2EE_SHARED_KEY` set you can drive them from a script using
+[`lazynton-js`](https://www.npmjs.com/package/lazynton-js); the raw endpoints
+speak `nonce(24) || ciphertext` and reject anything else with a 401 or 400.
+
+```ts
+import { LazyntonClient } from 'lazynton-js';
+const api = LazyntonClient.withSharedKey('http://localhost:8080', process.env.E2EE_SHARED_KEY);
+await api.post('/api/jobs/get', { id: '3f2a...' });
 ```
 
 ```json
@@ -123,9 +133,26 @@ real time rather than jumping 0 → 100.
 
 ### List
 
-```bash
-curl "http://localhost:8080/api/jobs?status=done&limit=20"
+`POST /api/jobs/search`, also encrypted:
+
+```json
+{ "status": "done", "q": "monday", "sort": "name", "favorite": true, "limit": 20, "offset": 0 }
 ```
+
+`sort` is one of `newest` (default), `oldest`, `name`, `name_desc`; starred jobs
+sort ahead of the rest either way. `q` matches the filename as a literal
+substring — a `%` or `_` typed into the search box is not a wildcard. The
+response carries `total` alongside the page so a pager can be drawn.
+
+### Rename and star
+
+```json
+PATCH /api/jobs/3f2a...   { "filename": "New Order - Blue Monday.mp3", "favorite": true }
+```
+
+Either field alone is fine. A rename changes the display name and the download
+filename only — the stored objects keep their original key, and demucs keeps
+using the name the file was uploaded under.
 
 ### Download
 
@@ -133,16 +160,53 @@ curl "http://localhost:8080/api/jobs?status=done&limit=20"
 curl -L -O -J http://localhost:8080/api/jobs/3f2a.../download/vocals
 ```
 
-Returns a 307 to a presigned RustFS URL (15 min default), so file bytes never
-pass through this process. `-L` is required.
+Without `AUDIO_KEY`, this is a 307 to a presigned RustFS URL (15 min default) so
+the bytes never pass through this process; `-L` is required. With `AUDIO_KEY`
+set it streams the ciphertext back instead — see below.
 
 ### Delete
 
 ```bash
-curl -X DELETE http://localhost:8080/api/jobs/3f2a...
+curl -X DELETE http://localhost:8080/api/jobs/3f2a... --data '{}'
 ```
 
-Removes the row and every object under `jobs/{id}/`. Refuses while running.
+Removes the row and every object under `jobs/{id}/`. Refuses while running. The
+body is not read but must be present: it goes through the E2EE middleware, and
+an encrypted empty string is indistinguishable there from a failed decrypt.
+
+## Encryption
+
+Two separate layers, both optional, neither of them a substitute for TLS.
+
+**The JSON API** goes through [lazynton](https://crates.io/crates/lazynton):
+the console does an X25519 handshake at `/handshake`, then every request body
+and successful response body is XChaCha20-Poly1305 over
+`application/octet-stream`. The session key is persisted encrypted-at-rest in
+the browser under a non-extractable WebCrypto key. `/healthz`, the multipart
+upload and the download route stay in the clear — the first is a container
+healthcheck, and the other two carry audio rather than JSON.
+
+**The audio** is covered by `AUDIO_KEY` instead, in a chunked AES-256-GCM format
+(`src/crypto.rs`, mirrored in `web/src/lib/audio-crypto.ts`, with a test that
+fails if the two ever disagree). The console seals a file before it leaves the
+browser, RustFS only ever stores that ciphertext, and the worker unseals it just
+long enough for demucs to run. Stems are sealed again before they go back up and
+are decrypted in the browser, which is why they stream back through the service
+when a key is set: fetching a presigned URL from JS would need CORS on the
+bucket.
+
+What this does and does not buy you, plainly:
+
+- The bytes are unreadable to anyone holding the RustFS bucket, or watching the
+  wire, without also holding the service's key.
+- It is **not** end-to-end in the strict sense. demucs needs plaintext audio, so
+  the service holds `AUDIO_KEY` and hands it to any client that completes a
+  handshake. With no auth in front of the service, that means anyone who can
+  reach it. The threat it actually addresses is a shared or untrusted object
+  store, not a compromised service.
+- Changing or removing `AUDIO_KEY` orphans everything uploaded under it. Turning
+  it on for the first time is safe: objects are checked for the format marker,
+  so jobs from before the switch still work.
 
 ## Tuning for a 4-core box
 
@@ -159,7 +223,14 @@ idle usually means `DEMUCS_THREADS` didn't take.
 
 ## Known gaps
 
-- No auth. Put it behind a reverse proxy or add a middleware layer.
+- No auth. Put it behind a reverse proxy or add a middleware layer. This is also
+  what keeps the audio encryption from being true E2EE — see above.
+- Renames are ASCII-only: the name ends up in a `Content-Disposition` header, so
+  it goes through the same sanitiser as an uploaded filename and a Thai title
+  comes back as underscores.
+- With `AUDIO_KEY` set, stem downloads stream through the service instead of
+  straight from RustFS, and the browser holds a whole stem in memory to decrypt
+  it. Fine for a 40 MB stem; not a streaming design.
 - Presigned URLs are signed against `S3_PUBLIC_ENDPOINT`, which has to be
   reachable from the *client*, not just from the app container. It falls back to
   `S3_ENDPOINT`, which is wrong the moment those two differ.

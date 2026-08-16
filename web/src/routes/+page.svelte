@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { dict, lang } from '$lib/i18n.svelte';
+	import { efetch, post } from '$lib/api';
+	import { CHUNK, decryptBytes, encryptFile } from '$lib/audio-crypto';
 
 	type Stem = { name: string; bytes: number; download_url: string };
 	type Job = {
@@ -11,6 +13,7 @@
 		two_stems: string | null;
 		stems: Stem[];
 		error: string | null;
+		favorite: boolean;
 		created_at: string;
 		started_at: string | null;
 		finished_at: string | null;
@@ -37,10 +40,19 @@
 		no_vocals: 'bg-ink-400'
 	};
 
+	const SORTS = ['newest', 'oldest', 'name', 'name_desc'] as const;
+	const PAGE = 20;
+
 	let jobs = $state<Job[]>([]);
+	let total = $state(0);
 	let queueDepth = $state(0);
 	let online = $state(true);
 	let loaded = $state(false);
+
+	let query = $state('');
+	let sort = $state<(typeof SORTS)[number]>('newest');
+	let favOnly = $state(false);
+	let offset = $state(0);
 
 	let model = $state('htdemucs');
 	let twoStems = $state(false);
@@ -55,10 +67,25 @@
 	// Tick once a second so the running durations count up between polls.
 	let now = $state(Date.now());
 
+	function filters() {
+		return {
+			limit: PAGE,
+			offset,
+			sort,
+			q: query.trim() || null,
+			favorite: favOnly || null
+		};
+	}
+
 	async function refresh() {
 		try {
-			const [j, h] = await Promise.all([fetch('/api/jobs?limit=50'), fetch('/healthz')]);
-			if (j.ok) jobs = (await j.json()).jobs;
+			// /healthz stays plaintext — it's the container's healthcheck too.
+			const [j, h] = await Promise.all([post('/api/jobs/search', filters()), fetch('/healthz')]);
+			if (j.ok) {
+				const body = await j.json();
+				jobs = body.jobs;
+				total = body.total;
+			}
 			if (h.ok) queueDepth = (await h.json()).queued ?? 0;
 			online = j.ok && h.ok;
 		} catch {
@@ -67,8 +94,17 @@
 		loaded = true;
 	}
 
+	// Filter changes shouldn't wait out the poll interval, and typing shouldn't
+	// fire a request per keystroke.
+	$effect(() => {
+		void [query, sort, favOnly, offset];
+		const t = setTimeout(refresh, 200);
+		return () => clearTimeout(t);
+	});
+
 	$effect(() => {
 		let stopped = false;
+		loadAudioKey();
 
 		(async function poll() {
 			while (!stopped) {
@@ -96,13 +132,52 @@
 		}
 	}
 
-	function upload(file: File) {
+	/// The audio key, fetched once over the encrypted channel. `null` means the
+	/// service has no AUDIO_KEY configured and audio moves in the clear.
+	let audioKey = $state<string | null>(null);
+	let sealing = $state(false);
+
+	async function loadAudioKey() {
+		try {
+			const r = await post('/api/audio-key', {});
+			if (r.ok) {
+				const body = await r.json();
+				audioKey = body.key ?? null;
+				if (audioKey && body.chunk !== CHUNK) {
+					// Different chunk sizes would produce audio that decrypts to
+					// garbage, so refuse rather than corrupt the upload.
+					audioKey = null;
+					notice = s.chunkMismatch;
+				}
+			}
+		} catch {
+			/* the poll will surface an offline service on its own */
+		}
+	}
+
+	async function upload(file: File) {
 		notice = null;
 		uploading = true;
 		uploadPct = 0;
 
+		let payload: Blob = file;
+		if (audioKey) {
+			sealing = true;
+			try {
+				payload = await encryptFile(file, audioKey);
+			} catch {
+				sealing = false;
+				uploading = false;
+				notice = s.encryptFailed;
+				return;
+			}
+			sealing = false;
+		}
+
 		const form = new FormData();
-		form.append('file', file);
+		// Keep the original name on the part: the server derives the stored key
+		// and demucs' input extension from it.
+		form.append('file', payload, file.name);
 		form.append('model', model);
 		if (twoStems) form.append('two_stems', 'vocals');
 
@@ -125,6 +200,28 @@
 		xhr.send(form);
 	}
 
+	/// Encrypted stems arrive as ciphertext, so the browser has to unseal them
+	/// and hand the user a Blob instead of just following the link.
+	async function download(job: Job, stem: Stem) {
+		if (!audioKey) return; // plain stems: let the anchor do its job
+		notice = null;
+		try {
+			const r = await fetch(stem.download_url);
+			if (!r.ok) throw new Error(String(r.status));
+			const blob = await decryptBytes(await r.arrayBuffer(), audioKey);
+
+			const base = job.filename.replace(/\.[^.]+$/, '');
+			const ext = stem.download_url.split('.').pop() ?? 'mp3';
+			const a = document.createElement('a');
+			a.href = URL.createObjectURL(blob);
+			a.download = `${base} - ${stem.name}.${ext}`;
+			a.click();
+			URL.revokeObjectURL(a.href);
+		} catch {
+			notice = s.decryptFailed;
+		}
+	}
+
 	function pick(files: FileList | null) {
 		const file = files?.[0];
 		if (file) upload(file);
@@ -136,9 +233,40 @@
 		if (!uploading) pick(e.dataTransfer?.files ?? null);
 	}
 
+	// Keyed by id, so the polling refresh underneath doesn't disturb the edit.
+	let editing = $state<string | null>(null);
+	let draft = $state('');
+
+	async function saveName(job: Job) {
+		// Enter commits and then blurs, so this runs twice for one edit.
+		if (editing !== job.id) return;
+		const name = draft.trim();
+		editing = null;
+		if (!name || name === job.filename) return;
+
+		const r = await efetch(`/api/jobs/${job.id}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ filename: name })
+		});
+		if (!r.ok) notice = errorText(await r.text(), s.renameFailed);
+		refresh();
+	}
+
+	async function toggleFavorite(job: Job) {
+		job.favorite = !job.favorite; // optimistic — the poll corrects it if the write fails
+		const r = await efetch(`/api/jobs/${job.id}`, {
+			method: 'PATCH',
+			body: JSON.stringify({ favorite: job.favorite })
+		});
+		if (!r.ok) notice = errorText(await r.text(), s.favoriteFailed);
+		refresh();
+	}
+
 	async function remove(job: Job) {
 		if (!confirm(s.confirmDelete(job.filename))) return;
-		const r = await fetch(`/api/jobs/${job.id}`, { method: 'DELETE' });
+		// The body isn't read, but it has to exist: an encrypted empty string
+		// decrypts to "", which lazynton can't tell from a failed decrypt.
+		const r = await efetch(`/api/jobs/${job.id}`, { method: 'DELETE', body: '{}' });
 		if (!r.ok) notice = errorText(await r.text(), s.deleteFailed);
 		refresh();
 	}
@@ -216,7 +344,7 @@
 			onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && fileInput?.click()}
 		>
 			{#if uploading}
-				<p class="text-sm text-ink-200">{s.uploading}</p>
+				<p class="text-sm text-ink-200">{sealing ? s.encrypting : s.uploading}</p>
 				<p class="tnum mt-3 text-3xl font-semibold text-accent">{uploadPct}%</p>
 			{:else}
 				<p class="text-sm text-ink-50">
@@ -287,11 +415,48 @@
 			{/if}
 		</h2>
 
+		<!-- ----------------------------------------------------------- toolbar -->
+		<div class="mb-3 flex flex-wrap items-center gap-2 text-xs">
+			<input
+				type="search"
+				bind:value={query}
+				oninput={() => (offset = 0)}
+				placeholder={s.searchPlaceholder}
+				aria-label={s.searchPlaceholder}
+				class="min-w-40 flex-1 rounded-lg bg-ink-850 px-3 py-1.5 text-ink-50 ring-1 ring-ink-700 placeholder:text-ink-600 focus-visible:ring-accent focus-visible:outline-none"
+			/>
+
+			<select
+				bind:value={sort}
+				onchange={() => (offset = 0)}
+				aria-label={s.sortLabel}
+				class="rounded-lg bg-ink-850 px-2.5 py-1.5 text-ink-50 ring-1 ring-ink-700 focus-visible:ring-accent focus-visible:outline-none"
+			>
+				{#each SORTS as id (id)}
+					<option value={id}>{s.sorts[id]}</option>
+				{/each}
+			</select>
+
+			<button
+				onclick={() => {
+					favOnly = !favOnly;
+					offset = 0;
+				}}
+				aria-pressed={favOnly}
+				class="rounded-lg px-2.5 py-1.5 ring-1 transition focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none
+					{favOnly
+					? 'bg-amber-400/10 text-amber-300 ring-amber-400/30'
+					: 'bg-ink-850 text-ink-400 ring-ink-700 hover:text-ink-200'}"
+			>
+				★ {s.favOnly}
+			</button>
+		</div>
+
 		{#if !loaded}
 			<p class="py-10 text-center text-sm text-ink-400">{s.loading}</p>
 		{:else if jobs.length === 0}
 			<p class="rounded-xl border border-ink-800 py-12 text-center text-sm text-ink-400">
-				{s.empty}
+				{query.trim() || favOnly ? s.noMatch : s.empty}
 			</p>
 		{:else}
 			<ul class="flex flex-col gap-2.5">
@@ -299,7 +464,35 @@
 					<li class="rounded-xl bg-ink-900/70 p-4 ring-1 ring-ink-800">
 						<div class="flex items-start gap-3">
 							<div class="min-w-0 flex-1">
-								<p class="truncate text-sm font-medium" title={job.filename}>{job.filename}</p>
+								{#if editing === job.id}
+									<input
+										value={draft}
+										oninput={(e) => (draft = e.currentTarget.value)}
+										onblur={() => saveName(job)}
+										onkeydown={(e) => {
+											if (e.key !== 'Enter' && e.key !== 'Escape') return;
+											if (e.key === 'Escape') draft = job.filename;
+											e.currentTarget.blur();
+											saveName(job); // committing here, not in onblur, keeps
+											// the keyboard path working even when the
+											// document isn't focused
+										}}
+										aria-label={s.renameAria(job.filename)}
+										{@attach (el: HTMLInputElement) => el.select()}
+										class="w-full rounded-md bg-ink-850 -ml-1.5 px-1.5 py-0.5 text-sm font-medium text-ink-50 ring-1 ring-ink-700 focus-visible:ring-accent focus-visible:outline-none"
+									/>
+								{:else}
+									<button
+										onclick={() => {
+											editing = job.id;
+											draft = job.filename;
+										}}
+										title={s.renameTitle}
+										class="block w-full truncate rounded-md -ml-1.5 px-1.5 py-0.5 text-left text-sm font-medium transition hover:bg-ink-850 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+									>
+										{job.filename}
+									</button>
+								{/if}
 								<p class="tnum mt-1 flex flex-wrap items-center gap-x-2 text-xs text-ink-400">
 									<span>{job.model}</span>
 									{#if job.two_stems}<span>· {s.twoStemsTag}</span>{/if}
@@ -312,6 +505,28 @@
 							>
 								{s.status[job.status] ?? job.status}
 							</span>
+
+							<button
+								onclick={() => toggleFavorite(job)}
+								title={job.favorite ? s.favoriteRemove : s.favoriteAdd}
+								aria-pressed={job.favorite}
+								aria-label={s.favoriteAria(job.filename)}
+								class="shrink-0 rounded-lg p-1.5 transition hover:bg-ink-800 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none
+									{job.favorite ? 'text-amber-300' : 'text-ink-600 hover:text-amber-300'}"
+							>
+								<svg
+									class="size-4"
+									viewBox="0 0 20 20"
+									fill={job.favorite ? 'currentColor' : 'none'}
+									stroke="currentColor"
+									stroke-width="1.5"
+								>
+									<path
+										d="M10 2.8l2.2 4.5 5 .7-3.6 3.5.9 4.9L10 14.1l-4.5 2.3.9-4.9L2.8 8l5-.7z"
+										stroke-linejoin="round"
+									/>
+								</svg>
+							</button>
 
 							<button
 								onclick={() => remove(job)}
@@ -348,6 +563,12 @@
 								{#each job.stems as stem (stem.name)}
 									<a
 										href={stem.download_url}
+										onclick={(e) => {
+											if (audioKey) {
+												e.preventDefault();
+												download(job, stem);
+											}
+										}}
 										class="group flex items-center gap-2 rounded-lg bg-ink-850 py-1.5 pr-3 pl-2.5 text-xs ring-1 ring-ink-700 transition hover:bg-ink-800 hover:ring-ink-600"
 									>
 										<span class="size-1.5 rounded-full {DOT[stem.name] ?? 'bg-ink-400'}"></span>
@@ -370,6 +591,28 @@
 					</li>
 				{/each}
 			</ul>
+
+			{#if total > PAGE}
+				<div class="mt-4 flex items-center justify-between text-xs text-ink-400">
+					<span class="tnum">{s.range(offset + 1, offset + jobs.length, total)}</span>
+					<div class="flex gap-2">
+						<button
+							onclick={() => (offset = Math.max(0, offset - PAGE))}
+							disabled={offset === 0}
+							class="rounded-lg bg-ink-850 px-2.5 py-1.5 ring-1 ring-ink-700 transition hover:text-ink-50 disabled:pointer-events-none disabled:opacity-30"
+						>
+							{s.prev}
+						</button>
+						<button
+							onclick={() => (offset += PAGE)}
+							disabled={offset + jobs.length >= total}
+							class="rounded-lg bg-ink-850 px-2.5 py-1.5 ring-1 ring-ink-700 transition hover:text-ink-50 disabled:pointer-events-none disabled:opacity-30"
+						>
+							{s.next}
+						</button>
+					</div>
+				</div>
+			{/if}
 		{/if}
 	</section>
 

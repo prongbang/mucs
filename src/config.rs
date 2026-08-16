@@ -33,6 +33,16 @@ pub struct Config {
     pub demucs_format: String,
     /// Hard ceiling on a single separation run.
     pub job_timeout_secs: u64,
+
+    /// Optional 32-byte hex pre-shared key for clients that skip the lazynton
+    /// X25519 handshake (curl, scripts). Unset = handshake required.
+    pub e2ee_shared_key: Option<String>,
+
+    /// 32-byte hex key for the audio itself: uploads arrive already encrypted
+    /// under it and stay that way in RustFS, and stems are encrypted before
+    /// they go back up. Unset = audio is stored in the clear, which is what
+    /// every job created before this key existed already is.
+    pub audio_key: Option<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -44,6 +54,19 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// A key typo must fail at boot, not halfway through someone's first upload.
+fn env_key(name: &str) -> anyhow::Result<Option<String>> {
+    let Some(key) = std::env::var(name).ok().filter(|k| !k.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let key = key.trim().to_ascii_lowercase();
+    anyhow::ensure!(
+        key.len() == 64 && hex::decode(&key).is_ok(),
+        "{name} must be 32 bytes of hex (64 characters)"
+    );
+    Ok(Some(key))
 }
 
 impl Config {
@@ -76,6 +99,11 @@ impl Config {
             demucs_threads: env_parse("DEMUCS_THREADS", cores),
             demucs_format: env_or("DEMUCS_FORMAT", "mp3"),
             job_timeout_secs: env_parse("JOB_TIMEOUT_SECS", 3600),
+
+            e2ee_shared_key: std::env::var("E2EE_SHARED_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
+            audio_key: env_key("AUDIO_KEY")?,
         })
     }
 }

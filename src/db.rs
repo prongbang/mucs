@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
 use std::str::FromStr;
 
 pub const STATUS_QUEUED: &str = "queued";
@@ -28,9 +28,21 @@ pub struct Job {
     /// JSON array of `Stem`, filled in once the job succeeds.
     pub stems: Option<String>,
     pub error: Option<String>,
+    pub favorite: bool,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+}
+
+/// Everything the jobs list can be narrowed or ordered by.
+#[derive(Default)]
+pub struct ListQuery<'a> {
+    pub status: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub favorites_only: bool,
+    pub sort: &'a str,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Clone)]
@@ -42,6 +54,36 @@ fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+/// Whitelist: this is the one place a client string reaches SQL unbound.
+fn order_by(sort: &str) -> &'static str {
+    match sort {
+        "oldest" => "created_at ASC",
+        "name" => "filename COLLATE NOCASE ASC",
+        "name_desc" => "filename COLLATE NOCASE DESC",
+        _ => "created_at DESC",
+    }
+}
+
+fn push_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, p: &ListQuery<'a>) {
+    qb.push(" WHERE 1 = 1");
+
+    if let Some(status) = p.status {
+        qb.push(" AND status = ").push_bind(status);
+    }
+
+    if let Some(term) = p.search.map(str::trim).filter(|t| !t.is_empty()) {
+        // The wildcards are ours, not the user's.
+        let escaped = term.replace('\\', r"\\").replace('%', r"\%").replace('_', r"\_");
+        qb.push(" AND filename LIKE ")
+            .push_bind(format!("%{escaped}%"))
+            .push(r" ESCAPE '\'");
+    }
+
+    if p.favorites_only {
+        qb.push(" AND favorite = 1");
+    }
 }
 
 impl Store {
@@ -69,6 +111,7 @@ impl Store {
                 two_stems   TEXT,
                 stems       TEXT,
                 error       TEXT,
+                favorite    INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL,
                 started_at  TEXT,
                 finished_at TEXT
@@ -77,6 +120,12 @@ impl Store {
         )
         .execute(&pool)
         .await?;
+
+        // Databases created before favourites existed. Erroring here means the
+        // column is already there, which is the whole point.
+        let _ = sqlx::query("ALTER TABLE jobs ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);")
             .execute(&pool)
@@ -189,6 +238,31 @@ impl Store {
         Ok(())
     }
 
+    /// Rename and/or star. `None` leaves that field alone. A rename touches the
+    /// display name only — `input_key` keeps pointing at the uploaded object.
+    pub async fn patch(
+        &self,
+        id: &str,
+        filename: Option<&str>,
+        favorite: Option<bool>,
+    ) -> Result<Option<Job>> {
+        let job = sqlx::query_as::<_, Job>(
+            r#"
+            UPDATE jobs
+               SET filename = COALESCE(?1, filename),
+                   favorite = COALESCE(?2, favorite)
+             WHERE id = ?3
+            RETURNING *
+            "#,
+        )
+        .bind(filename)
+        .bind(favorite)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(job)
+    }
+
     pub async fn get(&self, id: &str) -> Result<Option<Job>> {
         let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = ?1")
             .bind(id)
@@ -197,29 +271,29 @@ impl Store {
         Ok(job)
     }
 
-    pub async fn list(&self, status: Option<&str>, limit: i64, offset: i64) -> Result<Vec<Job>> {
-        let jobs = match status {
-            Some(s) => {
-                sqlx::query_as::<_, Job>(
-                    "SELECT * FROM jobs WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
-                )
-                .bind(s)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as::<_, Job>(
-                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        Ok(jobs)
+    /// One page of jobs, plus how many match the filters in total so the console
+    /// can draw the pager.
+    pub async fn list(&self, p: &ListQuery<'_>) -> Result<(Vec<Job>, i64)> {
+        let mut page = QueryBuilder::new("SELECT * FROM jobs");
+        push_filters(&mut page, p);
+        // Starred first regardless of sort — that's what starring is for.
+        page.push(" ORDER BY favorite DESC, ")
+            .push(order_by(p.sort))
+            .push(" LIMIT ")
+            .push_bind(p.limit)
+            .push(" OFFSET ")
+            .push_bind(p.offset);
+
+        let jobs = page
+            .build_query_as::<Job>()
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut count = QueryBuilder::new("SELECT COUNT(*) FROM jobs");
+        push_filters(&mut count, p);
+        let (total,): (i64,) = count.build_query_as().fetch_one(&self.pool).await?;
+
+        Ok((jobs, total))
     }
 
     pub async fn delete(&self, id: &str) -> Result<bool> {
@@ -237,5 +311,75 @@ impl Store {
             .fetch_one(&self.pool)
             .await?;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(jobs: &[Job]) -> Vec<&str> {
+        jobs.iter().map(|j| j.filename.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn search_sort_page_and_patch() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("mucs-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::connect(&format!("sqlite://{}?mode=rwc", path.display())).await?;
+
+        for (i, name) in ["b.mp3", "a.mp3", "100%_x.mp3"].iter().enumerate() {
+            store
+                .insert(&format!("id{i}"), name, "key", "htdemucs", None)
+                .await?;
+        }
+        store.patch("id0", None, Some(true)).await?;
+
+        // A `%` typed into the search box is a literal, not "match everything".
+        let (jobs, total) = store
+            .list(&ListQuery {
+                search: Some("100%"),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!((names(&jobs), total), (vec!["100%_x.mp3"], 1));
+
+        // Starred first, then the requested order.
+        let (jobs, total) = store
+            .list(&ListQuery {
+                sort: "name",
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!((names(&jobs), total), (vec!["b.mp3", "100%_x.mp3", "a.mp3"], 3));
+
+        // Last page is short, but `total` still counts every match.
+        let (jobs, total) = store
+            .list(&ListQuery {
+                sort: "name",
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!((names(&jobs), total), (vec!["a.mp3"], 3));
+
+        let (jobs, total) = store
+            .list(&ListQuery {
+                favorites_only: true,
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!((names(&jobs), total), (vec!["b.mp3"], 1));
+
+        // A rename must not move the object the job points at.
+        let job = store.patch("id1", Some("renamed.mp3"), None).await?.unwrap();
+        assert_eq!((job.filename.as_str(), job.input_key.as_str()), ("renamed.mp3", "key"));
+        assert!(!job.favorite, "patching the name must not clear the star");
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
     }
 }

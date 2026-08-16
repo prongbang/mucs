@@ -142,6 +142,22 @@ impl Storage {
         Ok(())
     }
 
+    /// Raw object body. Used for encrypted stems: the browser has to decrypt
+    /// them in JS, and a cross-origin presigned URL would need CORS on the
+    /// bucket, so those stream back through this process instead. Only ever
+    /// ciphertext, so the plaintext still never passes through here.
+    pub async fn get_stream(&self, key: &str) -> Result<ByteStream> {
+        let obj = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("get_object {key}"))?;
+        Ok(obj.body)
+    }
+
     /// Short-lived download URL, so the client pulls bytes straight from RustFS
     /// instead of streaming them through this process.
     pub async fn presign_get(&self, key: &str, filename: &str) -> Result<String> {
