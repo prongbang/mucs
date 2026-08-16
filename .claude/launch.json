@@ -3,9 +3,8 @@
 	"configurations": [
 		{
 			"name": "console",
-			"runtimeExecutable": "bun",
-			"runtimeArgs": ["run", "dev"],
-			"cwd": "web",
+			"runtimeExecutable": "sh",
+			"runtimeArgs": ["-c", "cd web && bun run dev --port 5173"],
 			"port": 5173
 		}
 	]

@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { dict, lang } from '$lib/i18n.svelte';
+
 	type Stem = { name: string; bytes: number; download_url: string };
 	type Job = {
 		id: string;
@@ -14,12 +16,9 @@
 		finished_at: string | null;
 	};
 
-	const MODELS: [string, string][] = [
-		['htdemucs', 'สมดุลที่สุดบน CPU'],
-		['htdemucs_ft', 'ละเอียดขึ้นนิดเดียว ช้ากว่า ~4×'],
-		['htdemucs_6s', '6 ราง เพิ่ม guitar / piano'],
-		['mdx_extra', 'คนละสถาปัตยกรรม ไว้เทียบผล']
-	];
+	const MODELS = ['htdemucs', 'htdemucs_ft', 'htdemucs_6s', 'mdx_extra'] as const;
+
+	const s = $derived(dict[lang.v]);
 
 	// Static class strings — Tailwind can't see them if they're built at runtime.
 	const PILL: Record<string, string> = {
@@ -27,12 +26,6 @@
 		running: 'bg-accent/15 text-accent ring-accent/30',
 		done: 'bg-emerald-400/10 text-emerald-300 ring-emerald-400/25',
 		failed: 'bg-rose-500/10 text-rose-300 ring-rose-500/25'
-	};
-	const STATUS_TH: Record<string, string> = {
-		queued: 'รอคิว',
-		running: 'กำลังแยก',
-		done: 'เสร็จแล้ว',
-		failed: 'ล้มเหลว'
 	};
 	const DOT: Record<string, string> = {
 		vocals: 'bg-rose-400',
@@ -59,7 +52,7 @@
 
 	let fileInput = $state<HTMLInputElement | null>(null);
 
-	// Tick once a second so the "กำลังแยก" durations count up between polls.
+	// Tick once a second so the running durations count up between polls.
 	let now = $state(Date.now());
 
 	async function refresh() {
@@ -122,12 +115,12 @@
 		};
 		xhr.onload = () => {
 			uploading = false;
-			if (xhr.status >= 400) notice = errorText(xhr.responseText, `อัปโหลดไม่สำเร็จ (${xhr.status})`);
+			if (xhr.status >= 400) notice = errorText(xhr.responseText, s.uploadFailed(xhr.status));
 			refresh();
 		};
 		xhr.onerror = () => {
 			uploading = false;
-			notice = 'ต่อ service ไม่ติด — เช็คว่า demucs-service ที่ :8080 รันอยู่';
+			notice = s.noService;
 		};
 		xhr.send(form);
 	}
@@ -144,9 +137,9 @@
 	}
 
 	async function remove(job: Job) {
-		if (!confirm(`ลบ "${job.filename}" และ stems ทั้งหมดออกจาก storage?`)) return;
+		if (!confirm(s.confirmDelete(job.filename))) return;
 		const r = await fetch(`/api/jobs/${job.id}`, { method: 'DELETE' });
-		if (!r.ok) notice = errorText(await r.text(), 'ลบไม่สำเร็จ');
+		if (!r.ok) notice = errorText(await r.text(), s.deleteFailed);
 		refresh();
 	}
 
@@ -160,36 +153,45 @@
 	}
 
 	function timing(job: Job) {
-		if (job.status === 'queued') return 'รอ worker ว่าง';
+		if (job.status === 'queued') return s.waiting;
 		const start = Date.parse(job.started_at ?? job.created_at);
 		const end = job.finished_at ? Date.parse(job.finished_at) : now;
-		return `${job.status === 'running' ? 'ผ่านไป' : 'ใช้เวลา'} ${fmtDuration(end - start)}`;
+		return `${job.status === 'running' ? s.elapsed : s.took} ${fmtDuration(end - start)}`;
 	}
 
 	let active = $derived(jobs.filter((j) => j.status === 'running' || j.status === 'queued').length);
 </script>
 
-<svelte:head><title>mucs — แยก stems</title></svelte:head>
+<svelte:head><title>{s.title}</title></svelte:head>
 
 <div class="mx-auto flex min-h-dvh max-w-3xl flex-col gap-8 px-5 py-10 sm:py-14">
 	<!-- ------------------------------------------------------------ header -->
 	<header class="flex items-baseline justify-between gap-4">
 		<div>
 			<h1 class="text-2xl font-semibold tracking-tight">mucs</h1>
-			<p class="mt-1 text-sm text-ink-400">แยกเสียงร้อง กลอง เบส ออกจากเพลง ด้วย demucs</p>
+			<p class="mt-1 text-sm text-ink-400">{s.tagline}</p>
 		</div>
 
-		<div
-			class="flex shrink-0 items-center gap-2 rounded-full bg-ink-850 px-3 py-1.5 text-xs ring-1 ring-ink-800"
-			title={online ? 'service ตอบปกติ' : 'ต่อ service ไม่ติด'}
-		>
-			<span
-				class="size-1.5 rounded-full {online ? 'bg-emerald-400' : 'bg-rose-500'}"
-				class:animate-pulse={!online}
-			></span>
-			<span class="tnum text-ink-200">
-				{online ? (queueDepth > 0 ? `${queueDepth} งานในคิว` : 'ว่าง') : 'ออฟไลน์'}
-			</span>
+		<div class="flex shrink-0 items-center gap-2">
+			<button
+				onclick={() => lang.toggle()}
+				class="rounded-full bg-ink-850 px-3 py-1.5 text-xs text-ink-200 ring-1 ring-ink-800 transition hover:text-ink-50 hover:ring-ink-600 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+			>
+				{s.switchTo}
+			</button>
+
+			<div
+				class="flex items-center gap-2 rounded-full bg-ink-850 px-3 py-1.5 text-xs ring-1 ring-ink-800"
+				title={online ? s.serviceUp : s.serviceDown}
+			>
+				<span
+					class="size-1.5 rounded-full {online ? 'bg-emerald-400' : 'bg-rose-500'}"
+					class:animate-pulse={!online}
+				></span>
+				<span class="tnum text-ink-200">
+					{online ? (queueDepth > 0 ? s.queueN(queueDepth) : s.idle) : s.offline}
+				</span>
+			</div>
 		</div>
 	</header>
 
@@ -198,7 +200,7 @@
 		<div
 			role="button"
 			tabindex="0"
-			aria-label="เลือกไฟล์เพลงเพื่ออัปโหลด"
+			aria-label={s.dropAria}
 			aria-busy={uploading}
 			class="group relative w-full overflow-hidden rounded-2xl border border-dashed p-8 text-center transition
 				focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none
@@ -214,13 +216,13 @@
 			onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && fileInput?.click()}
 		>
 			{#if uploading}
-				<p class="text-sm text-ink-200">กำลังอัปโหลด…</p>
+				<p class="text-sm text-ink-200">{s.uploading}</p>
 				<p class="tnum mt-3 text-3xl font-semibold text-accent">{uploadPct}%</p>
 			{:else}
 				<p class="text-sm text-ink-50">
-					ลากไฟล์เพลงมาวาง หรือ <span class="text-accent underline underline-offset-4">เลือกไฟล์</span>
+					{s.dropPrefix}<span class="text-accent underline underline-offset-4">{s.dropLink}</span>
 				</p>
-				<p class="mt-2 text-xs text-ink-400">mp3 · wav · flac · m4a — สูงสุด 256 MB</p>
+				<p class="mt-2 text-xs text-ink-400">{s.formats}</p>
 			{/if}
 
 			<!-- Upload progress doubles as the panel's bottom edge. -->
@@ -243,13 +245,13 @@
 
 		<div class="mt-3 flex flex-wrap items-center gap-3 text-xs">
 			<label class="flex items-center gap-2">
-				<span class="text-ink-400">โมเดล</span>
+				<span class="text-ink-400">{s.model}</span>
 				<select
 					bind:value={model}
 					class="rounded-lg bg-ink-850 px-2.5 py-1.5 text-ink-50 ring-1 ring-ink-700 focus-visible:ring-accent focus-visible:outline-none"
 				>
-					{#each MODELS as [id, hint] (id)}
-						<option value={id}>{id} — {hint}</option>
+					{#each MODELS as id (id)}
+						<option value={id}>{id} — {s.models[id]}</option>
 					{/each}
 				</select>
 			</label>
@@ -260,7 +262,7 @@
 					bind:checked={twoStems}
 					class="size-3.5 accent-[var(--color-accent)]"
 				/>
-				แยกแค่ 2 ราง (vocals / no_vocals) — เร็วกว่า
+				{s.twoStems}
 			</label>
 		</div>
 
@@ -270,7 +272,7 @@
 			>
 				<span class="grow">{notice}</span>
 				<button class="shrink-0 text-rose-300/70 hover:text-rose-200" onclick={() => (notice = null)}>
-					ปิด
+					{s.close}
 				</button>
 			</p>
 		{/if}
@@ -279,17 +281,17 @@
 	<!-- -------------------------------------------------------------- jobs -->
 	<section class="flex-1">
 		<h2 class="mb-3 flex items-center gap-2 text-xs font-medium tracking-wide text-ink-400 uppercase">
-			งาน
+			{s.jobs}
 			{#if active > 0}
 				<span class="tnum rounded-full bg-accent/15 px-1.5 text-accent">{active}</span>
 			{/if}
 		</h2>
 
 		{#if !loaded}
-			<p class="py-10 text-center text-sm text-ink-400">กำลังโหลด…</p>
+			<p class="py-10 text-center text-sm text-ink-400">{s.loading}</p>
 		{:else if jobs.length === 0}
 			<p class="rounded-xl border border-ink-800 py-12 text-center text-sm text-ink-400">
-				ยังไม่มีงาน — อัปโหลดเพลงแรกได้เลย
+				{s.empty}
 			</p>
 		{:else}
 			<ul class="flex flex-col gap-2.5">
@@ -300,7 +302,7 @@
 								<p class="truncate text-sm font-medium" title={job.filename}>{job.filename}</p>
 								<p class="tnum mt-1 flex flex-wrap items-center gap-x-2 text-xs text-ink-400">
 									<span>{job.model}</span>
-									{#if job.two_stems}<span>· 2 ราง</span>{/if}
+									{#if job.two_stems}<span>· {s.twoStemsTag}</span>{/if}
 									<span>· {timing(job)}</span>
 								</p>
 							</div>
@@ -308,14 +310,14 @@
 							<span
 								class="shrink-0 rounded-full px-2.5 py-1 text-xs ring-1 ring-inset {PILL[job.status]}"
 							>
-								{STATUS_TH[job.status] ?? job.status}
+								{s.status[job.status] ?? job.status}
 							</span>
 
 							<button
 								onclick={() => remove(job)}
 								disabled={job.status === 'running'}
-								title={job.status === 'running' ? 'ลบไม่ได้ระหว่างประมวลผล' : 'ลบงานและไฟล์'}
-								aria-label="ลบงาน {job.filename}"
+								title={job.status === 'running' ? s.deleteBusy : s.deleteTitle}
+								aria-label={s.deleteAria(job.filename)}
 								class="shrink-0 rounded-lg p-1.5 text-ink-400 transition hover:bg-ink-800 hover:text-rose-300 disabled:pointer-events-none disabled:opacity-30"
 							>
 								<svg class="size-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -371,7 +373,5 @@
 		{/if}
 	</section>
 
-	<footer class="text-center text-xs text-ink-600">
-		งานเดินทีละหนึ่ง — demucs กิน CPU ทุกคอร์อยู่แล้ว
-	</footer>
+	<footer class="text-center text-xs text-ink-600">{s.footer}</footer>
 </div>
