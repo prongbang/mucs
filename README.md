@@ -154,6 +154,15 @@ Either field alone is fine. A rename changes the display name and the download
 filename only — the stored objects keep their original key, and demucs keeps
 using the name the file was uploaded under.
 
+The display name is not restricted to ASCII: `ลมหายใจ.mp3` stays itself, in the
+job list, in search, and on the downloaded file. Only path separators, control
+characters and quotes are stripped, and it is capped at 200 characters. That
+works because the name travels in the JSON body and never becomes a storage key;
+the one place it has to enter a header, the download's `Content-Disposition`, it
+goes as RFC 5987 `filename*=UTF-8''…` with an ASCII `filename` fallback beside
+it. The same now applies to uploads — a file called `ลมหายใจ.mp3` keeps its title
+in the console while the object under it is stored under an ASCII key.
+
 ### Download
 
 ```bash
@@ -241,9 +250,6 @@ idle usually means `DEMUCS_THREADS` didn't take.
 
 - No auth. Put it behind a reverse proxy or add a middleware layer. This is also
   what keeps the audio encryption from being true E2EE — see above.
-- Renames are ASCII-only: the name ends up in a `Content-Disposition` header, so
-  it goes through the same sanitiser as an uploaded filename and a Thai title
-  comes back as underscores.
 - With `AUDIO_KEY` set, stem downloads stream through the service instead of
   straight from RustFS, and the browser holds a whole stem in memory to decrypt
   it. Fine for a 40 MB stem; not a streaming design.

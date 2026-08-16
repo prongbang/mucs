@@ -160,9 +160,12 @@ impl Storage {
 
     /// Short-lived download URL, so the client pulls bytes straight from RustFS
     /// instead of streaming them through this process.
-    pub async fn presign_get(&self, key: &str, filename: &str) -> Result<String> {
+    /// `disposition` is a complete Content-Disposition value — the caller builds
+    /// it, because getting a non-ASCII filename through a header is RFC 5987's
+    /// problem, not storage's.
+    pub async fn presign_get(&self, key: &str, disposition: &str) -> Result<String> {
         let cfg = PresigningConfig::expires_in(Duration::from_secs(self.presign_secs))?;
-        let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', ""));
+        let disposition = disposition.to_string();
 
         let req = self
             .presign_client

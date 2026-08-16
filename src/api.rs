@@ -115,6 +115,50 @@ impl JobView {
     }
 }
 
+// ------------------------------------------------------------------- naming
+
+/// Cleans a user-supplied display name while leaving its script alone. This is
+/// not [`sanitize`] — that one produces storage keys and demucs input paths and
+/// has to stay ASCII. Returns `None` if nothing usable is left.
+pub fn clean_display_name(raw: &str) -> Option<String> {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+
+    let cleaned: String = base
+        // Control characters would break the header this ends up in, and a
+        // quote would end the quoted string early.
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"')
+        .collect();
+
+    // Long enough for any real title, short enough that it can't bloat a header.
+    let cleaned: String = cleaned.trim().trim_matches('.').chars().take(200).collect();
+    let cleaned = cleaned.trim().to_string();
+
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// A header value can't hold raw non-ASCII, so a Thai title has to travel
+/// percent-encoded in `filename*` (RFC 5987). `filename` keeps an ASCII
+/// approximation for anything that doesn't read the starred form.
+pub fn content_disposition(name: &str) -> String {
+    // attr-char from RFC 5987 — everything else gets percent-encoded.
+    const SAFE: &[u8] = b"!#$&+-.^_`|~";
+    let mut encoded = String::new();
+    for b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() || SAFE.contains(b) {
+            encoded.push(*b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        sanitize(name),
+        encoded
+    )
+}
+
 // ---------------------------------------------------------------- handlers
 
 async fn healthz(State(st): State<AppState>) -> AppResult<Json<serde_json::Value>> {
@@ -137,6 +181,9 @@ async fn create_job(
         .map_err(|e| AppError::Other(e.into()))?;
 
     let mut filename: Option<String> = None;
+    // What the console shows. Kept apart from the storage name so an upload
+    // called `ลมหายใจ.mp3` reads as itself in the job list.
+    let mut display: Option<String> = None;
     let mut temp_path: Option<std::path::PathBuf> = None;
     let mut model = st.cfg.demucs_model.clone();
     let mut two_stems: Option<String> = None;
@@ -148,7 +195,11 @@ async fn create_job(
     {
         match field.name().unwrap_or_default() {
             "file" => {
-                let name = sanitize(field.file_name().unwrap_or("upload.mp3"));
+                let raw = field.file_name().unwrap_or("upload.mp3").to_string();
+                // The stored key and demucs' input path stay ASCII; only the
+                // display name keeps the original script.
+                let name = sanitize(&raw);
+                display = clean_display_name(&raw);
                 let dest = scratch.join(&name);
 
                 // Stream to disk instead of buffering the whole song in memory.
@@ -212,7 +263,13 @@ async fn create_job(
 
     let job = st
         .store
-        .insert(&id, &filename, &input_key, &model, two_stems.as_deref())
+        .insert(
+            &id,
+            display.as_deref().unwrap_or(&filename),
+            &input_key,
+            &model,
+            two_stems.as_deref(),
+        )
         .await
         .map_err(AppError::Other)?;
 
@@ -359,7 +416,7 @@ async fn download_stem(
         let disposition = if p.inline {
             "inline".to_string()
         } else {
-            format!("attachment; filename=\"{}\"", download_name.replace('"', ""))
+            content_disposition(&download_name)
         };
 
         return Ok((
@@ -374,11 +431,63 @@ async fn download_stem(
 
     let url = st
         .storage
-        .presign_get(&stem.key, &download_name)
+        .presign_get(&stem.key, &content_disposition(&download_name))
         .await
         .map_err(AppError::Other)?;
 
     Ok(Redirect::temporary(&url).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_names_keep_their_script() {
+        // The case this exists for: a Thai title used to come back as `_______`.
+        assert_eq!(
+            clean_display_name("ลมหายใจ.mp3").as_deref(),
+            Some("ลมหายใจ.mp3")
+        );
+        assert_eq!(
+            clean_display_name("Björk — Jóga.flac").as_deref(),
+            Some("Björk — Jóga.flac")
+        );
+
+        // Still not a path, and still can't break out of the header.
+        assert_eq!(
+            clean_display_name("../../etc/ลับ.mp3").as_deref(),
+            Some("ลับ.mp3")
+        );
+        // A name carrying a slash is a path: only the last segment survives, so
+        // this keeps nothing of the injected part.
+        assert_eq!(clean_display_name("a\"; rm -rf /\".mp3").as_deref(), Some("mp3"));
+        assert_eq!(clean_display_name("bad\r\nname.mp3").as_deref(), Some("badname.mp3"));
+
+        // Nothing usable left.
+        assert_eq!(clean_display_name("   "), None);
+        assert_eq!(clean_display_name("///"), None);
+        assert_eq!(clean_display_name(""), None);
+
+        assert_eq!(clean_display_name(&"ก".repeat(400)).unwrap().chars().count(), 200);
+    }
+
+    #[test]
+    fn thai_names_survive_the_download_header() {
+        let d = content_disposition("ลม - vocals.mp3");
+
+        // A header value has to be ASCII whatever the name was.
+        assert!(d.is_ascii(), "{d}");
+        // The starred form carries the real name; the plain one is the fallback.
+        assert!(d.contains("filename*=UTF-8''"), "{d}");
+        assert!(d.contains("%E0%B8%A5%E0%B8%A1"), "{d}"); // ลม
+        assert!(d.contains("filename=\"__ - vocals.mp3\""), "{d}");
+
+        // ASCII names come through unmangled in both forms.
+        let plain = content_disposition("song - bass.mp3");
+        assert!(plain.contains("filename=\"song - bass.mp3\""), "{plain}");
+        assert!(plain.contains("filename*=UTF-8''song%20-%20bass.mp3"), "{plain}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -394,13 +503,16 @@ async fn patch_job(
     AxPath(id): AxPath<String>,
     Json(body): Json<PatchBody>,
 ) -> AppResult<Json<JobView>> {
-    // Same rules as the upload path: this string ends up in a
-    // Content-Disposition header.
+    // Unlike an upload, this name never becomes a storage key or a path handed
+    // to demucs — it is only ever displayed and echoed back in JSON. So it keeps
+    // its own script; `สมชาย - ลมหายใจ.mp3` stays that instead of being flattened
+    // to underscores. Separators and controls still go, and the header that
+    // carries it on the download route is RFC 5987 encoded.
     let filename = match body.filename {
-        Some(f) if f.trim().is_empty() => {
-            return Err(AppError::BadRequest("filename is empty".into()))
-        }
-        Some(f) => Some(sanitize(&f)),
+        Some(f) => match clean_display_name(&f) {
+            Some(name) => Some(name),
+            None => return Err(AppError::BadRequest("filename is empty".into())),
+        },
         None => None,
     };
 
