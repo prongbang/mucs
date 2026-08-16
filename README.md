@@ -164,6 +164,22 @@ Without `AUDIO_KEY`, this is a 307 to a presigned RustFS URL (15 min default) so
 the bytes never pass through this process; `-L` is required. With `AUDIO_KEY`
 set it streams the ciphertext back instead — see below.
 
+Adding `?inline=true` streams the stem same-origin with an `inline` disposition
+instead of redirecting. That is what the console's player uses: `fetch` against a
+presigned URL on another host would need CORS on the bucket, and a cross-origin
+`<audio>` element can't be routed through Web Audio at all.
+
+## Player
+
+Each finished job has a **Play** button that opens a small mixer: transport,
+scrubber, and one row per stem with mute, solo and a volume fader.
+
+All the stems are decoded up front and started on a single `AudioContext` clock,
+so they stay sample-aligned — muting `vocals` leaves the rest exactly where it
+was. Separate `<audio>` elements would drift apart within seconds, which is the
+whole thing you separated the track to avoid. The cost is memory: every stem is
+held as a decoded `AudioBuffer`, roughly 85 MB per four-minute stereo stem.
+
 ### Delete
 
 ```bash

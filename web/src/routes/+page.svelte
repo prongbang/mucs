@@ -2,6 +2,7 @@
 	import { dict, lang } from '$lib/i18n.svelte';
 	import { efetch, post } from '$lib/api';
 	import { CHUNK, decryptBytes, encryptFile } from '$lib/audio-crypto';
+	import { StemPlayer } from '$lib/stem-player.svelte';
 
 	type Stem = { name: string; bytes: number; download_url: string };
 	type Job = {
@@ -137,7 +138,7 @@
 	let audioKey = $state<string | null>(null);
 	let sealing = $state(false);
 
-	async function loadAudioKey() {
+	async function loadAudioKey(attempt = 0) {
 		try {
 			const r = await post('/api/audio-key', {});
 			if (r.ok) {
@@ -149,10 +150,19 @@
 					audioKey = null;
 					notice = s.chunkMismatch;
 				}
+				return;
 			}
 		} catch {
-			/* the poll will surface an offline service on its own */
+			/* fall through to the retry */
 		}
+
+		// A session left in storage by a previous run of the service 401s here,
+		// and racing the first list request can lose lazynton's one silent
+		// re-handshake. Retrying lands after it has settled. Failing quietly
+		// would be worse than useless: with no key the console would upload in
+		// the clear and try to play ciphertext.
+		if (attempt < 2) setTimeout(() => loadAudioKey(attempt + 1), 400);
+		else notice = s.audioKeyFailed;
 	}
 
 	async function upload(file: File) {
@@ -198,6 +208,22 @@
 			notice = s.noService;
 		};
 		xhr.send(form);
+	}
+
+	// One player for the whole page: two jobs playing at once is just noise.
+	const player = new StemPlayer();
+
+	function togglePlayer(job: Job) {
+		if (player.jobId === job.id) {
+			player.close();
+			return;
+		}
+		player.load(job.id, job.stems, audioKey);
+	}
+
+	function fmtTime(s: number) {
+		const t = Math.max(0, Math.floor(s));
+		return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
 	}
 
 	/// Encrypted stems arrive as ciphertext, so the browser has to unseal them
@@ -560,6 +586,23 @@
 
 						{#if job.stems.length > 0}
 							<div class="mt-3 flex flex-wrap gap-2">
+								<button
+									onclick={() => togglePlayer(job)}
+									aria-expanded={player.jobId === job.id}
+									class="flex items-center gap-2 rounded-lg py-1.5 pr-3 pl-2.5 text-xs ring-1 transition
+										{player.jobId === job.id
+										? 'bg-accent/15 text-accent ring-accent/30'
+										: 'bg-ink-850 text-ink-50 ring-ink-700 hover:bg-ink-800 hover:ring-ink-600'}"
+								>
+									<svg class="size-3.5" viewBox="0 0 16 16" fill="currentColor">
+										{#if player.jobId === job.id}
+											<path d="M4 3h3v10H4zM9 3h3v10H9z" />
+										{:else}
+											<path d="M5 3.5v9l7-4.5z" />
+										{/if}
+									</svg>
+									{player.jobId === job.id ? s.closePlayer : s.play}
+								</button>
 								{#each job.stems as stem (stem.name)}
 									<a
 										href={stem.download_url}
@@ -587,6 +630,93 @@
 									</a>
 								{/each}
 							</div>
+
+							{#if player.jobId === job.id}
+								<div class="mt-3 rounded-xl bg-ink-950/50 p-3 ring-1 ring-ink-800">
+									{#if player.loading}
+										<p class="py-3 text-center text-xs text-ink-400">{s.loadingStems}</p>
+									{:else if player.error}
+										<p class="py-2 text-center text-xs text-rose-300">{player.error}</p>
+									{:else}
+										<!-- transport -->
+										<div class="flex items-center gap-3">
+											<button
+												onclick={() => player.toggle()}
+												aria-label={player.playing ? s.pause : s.play}
+												class="grid size-9 shrink-0 place-items-center rounded-full bg-accent text-ink-950 transition hover:brightness-110 focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+											>
+												<svg class="size-4" viewBox="0 0 16 16" fill="currentColor">
+													{#if player.playing}
+														<path d="M4 3h3v10H4zM9 3h3v10H9z" />
+													{:else}
+														<path d="M5 3.5v9l7-4.5z" />
+													{/if}
+												</svg>
+											</button>
+
+											<input
+												type="range"
+												min="0"
+												max={player.duration || 1}
+												step="0.01"
+												value={player.position}
+												oninput={(e) => player.seek(+e.currentTarget.value)}
+												aria-label={s.seek}
+												class="h-1 flex-1 cursor-pointer accent-[var(--color-accent)]"
+											/>
+
+											<span class="tnum shrink-0 text-xs text-ink-400">
+												{fmtTime(player.position)} / {fmtTime(player.duration)}
+											</span>
+										</div>
+
+										<!-- one row per stem -->
+										<div class="mt-3 flex flex-col gap-1.5">
+											{#each player.tracks as track (track.name)}
+												<div class="flex items-center gap-2 text-xs">
+													<span class="size-1.5 shrink-0 rounded-full {DOT[track.name] ?? 'bg-ink-400'}"
+													></span>
+													<span
+														class="w-20 shrink-0 truncate {track.muted ? 'text-ink-600' : 'text-ink-50'}"
+													>
+														{track.name}
+													</span>
+
+													<button
+														onclick={() => player.setMuted(track, !track.muted)}
+														aria-pressed={track.muted}
+														title={s.mute}
+														class="shrink-0 rounded px-1.5 py-0.5 ring-1 transition
+															{track.muted
+															? 'bg-rose-500/10 text-rose-300 ring-rose-500/25'
+															: 'text-ink-400 ring-ink-700 hover:text-ink-100'}"
+													>
+														M
+													</button>
+													<button
+														onclick={() => player.solo(track)}
+														title={s.solo}
+														class="shrink-0 rounded px-1.5 py-0.5 text-ink-400 ring-1 ring-ink-700 transition hover:text-amber-300"
+													>
+														S
+													</button>
+
+													<input
+														type="range"
+														min="0"
+														max="1"
+														step="0.01"
+														value={track.volume}
+														oninput={(e) => player.setVolume(track, +e.currentTarget.value)}
+														aria-label={s.volumeAria(track.name)}
+														class="h-1 flex-1 cursor-pointer accent-[var(--color-accent)]"
+													/>
+												</div>
+											{/each}
+										</div>
+									{/if}
+								</div>
+							{/if}
 						{/if}
 					</li>
 				{/each}

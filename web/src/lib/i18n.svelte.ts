@@ -50,10 +50,20 @@ export const dict = {
 		renameAria: (f: string) => `แก้ชื่องาน ${f}`,
 		renameFailed: 'เปลี่ยนชื่อไม่สำเร็จ',
 
+		play: 'เล่น',
+		pause: 'หยุด',
+		closePlayer: 'ปิด player',
+		loadingStems: 'กำลังโหลด stems…',
+		seek: 'เลื่อนตำแหน่งเพลง',
+		mute: 'ปิดเสียงรางนี้',
+		solo: 'ฟังเฉพาะรางนี้',
+		volumeAria: (n: string) => `ระดับเสียงราง ${n}`,
+
 		encrypting: 'กำลังเข้ารหัสไฟล์…',
 		encryptFailed: 'เข้ารหัสไฟล์ไม่สำเร็จ — ยังไม่ได้อัปโหลด',
 		decryptFailed: 'ถอดรหัสไฟล์ที่ดาวน์โหลดไม่สำเร็จ',
 		chunkMismatch: 'ขนาด chunk ของ server ไม่ตรงกับ console — ปิดการเข้ารหัสเสียงไว้ก่อน',
+		audioKeyFailed: 'ขอ audio key ไม่สำเร็จ — รีเฟรชหน้าก่อนอัปโหลดหรือเล่นเพลง',
 
 		prev: 'ก่อนหน้า',
 		next: 'ถัดไป',
@@ -126,10 +136,20 @@ export const dict = {
 		renameAria: (f: string) => `rename job ${f}`,
 		renameFailed: 'rename failed',
 
+		play: 'Play',
+		pause: 'Pause',
+		closePlayer: 'Close',
+		loadingStems: 'Loading stems…',
+		seek: 'seek',
+		mute: 'mute this stem',
+		solo: 'solo this stem',
+		volumeAria: (n: string) => `${n} volume`,
+
 		encrypting: 'Encrypting…',
 		encryptFailed: "couldn't encrypt the file — nothing was uploaded",
 		decryptFailed: "couldn't decrypt the downloaded stem",
 		chunkMismatch: "the service's chunk size doesn't match this console — audio encryption is off",
+		audioKeyFailed: 'could not fetch the audio key — reload before uploading or playing',
 
 		prev: 'Previous',
 		next: 'Next',

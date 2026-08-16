@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Multipart, Path as AxPath, State};
+use axum::extract::{Multipart, Path as AxPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, patch, post};
@@ -289,9 +289,19 @@ async fn audio_key(State(st): State<AppState>) -> Json<serde_json::Value> {
 
 /// Hands back a 307 to a presigned RustFS URL so the bytes never transit this
 /// process. Falls back to nothing clever — if the job isn't done, say so.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub struct DownloadParams {
+    /// Play it rather than save it: streams same-origin so the console can
+    /// `fetch` and decode the bytes. Spelt `?inline=true` — a query string
+    /// carries no types, so serde won't take `1` for a bool.
+    pub inline: bool,
+}
+
 async fn download_stem(
     State(st): State<AppState>,
     AxPath((id, stem_name)): AxPath<(String, String)>,
+    Query(p): Query<DownloadParams>,
 ) -> AppResult<impl IntoResponse> {
     let job = st
         .store
@@ -326,24 +336,36 @@ async fn download_stem(
     let ext = stem.key.rsplit('.').next().unwrap_or("mp3");
     let download_name = format!("{base} - {}.{ext}", stem.name);
 
-    // An encrypted stem has to be decrypted in the browser, and fetching a
-    // presigned URL from JS would need CORS configured on the bucket. Streaming
-    // the ciphertext back through here keeps it same-origin; the plaintext still
-    // never exists on this path.
-    if st.cfg.audio_key.is_some() {
+    // Two reasons to stream through this process instead of redirecting:
+    // an encrypted stem has to be decrypted in the browser, and the player has
+    // to read the bytes with `fetch` to decode them. Both would need CORS on the
+    // bucket to work against a presigned URL. Whatever passes through here is
+    // still ciphertext whenever a key is set.
+    if st.cfg.audio_key.is_some() || p.inline {
         let stream = st
             .storage
             .get_stream(&stem.key)
             .await
             .map_err(AppError::Other)?;
 
+        let content_type = match (st.cfg.audio_key.is_some(), ext) {
+            (true, _) => "application/octet-stream",
+            (false, "wav") => "audio/wav",
+            (false, "flac") => "audio/flac",
+            (false, _) => "audio/mpeg",
+        };
+
+        // `inline` is the player asking to play it, not the user asking to keep it.
+        let disposition = if p.inline {
+            "inline".to_string()
+        } else {
+            format!("attachment; filename=\"{}\"", download_name.replace('"', ""))
+        };
+
         return Ok((
             [
-                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                (
-                    header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", download_name.replace('"', "")),
-                ),
+                (header::CONTENT_TYPE, content_type.to_string()),
+                (header::CONTENT_DISPOSITION, disposition),
             ],
             Body::from_stream(tokio_util::io::ReaderStream::new(stream.into_async_read())),
         )
