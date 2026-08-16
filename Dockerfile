@@ -1,5 +1,7 @@
 # ---------- build the console ----------
-FROM oven/bun:1 AS web
+# Pinned: the moving `1` tag lets a host reuse a node_modules layer that an
+# older bun installed, and the stale vite shim in it breaks the build.
+FROM oven/bun:1.3.14 AS web
 WORKDIR /web
 COPY web/package.json web/bun.lockb ./
 RUN bun install --frozen-lockfile
