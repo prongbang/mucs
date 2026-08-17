@@ -2,7 +2,8 @@
 name = "demucs-service"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# lazynton 0.3 pulls lazyxchacha 0.2, whose aead 0.6 is an edition-2024 crate.
+rust-version = "1.85"
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart", "macros"] }
@@ -34,8 +35,8 @@ mime_guess = "2"
 # Bakes web/build into the binary in release; reads it off disk in debug builds,
 # so `bun run dev` stays the loop for working on the console.
 rust-embed = "8"
-lazynton = "0.2.0"
-aes-gcm = "0.10.3"
+lazynton = "0.3.0"
+lazyxchacha = "0.2.0"
 sha2 = "0.10.9"
 hex = "0.4.3"
 

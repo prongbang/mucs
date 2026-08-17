@@ -211,14 +211,15 @@ the browser under a non-extractable WebCrypto key. `/healthz`, the multipart
 upload and the download route stay in the clear — the first is a container
 healthcheck, and the other two carry audio rather than JSON.
 
-**The audio** is covered by `AUDIO_KEY` instead, in a chunked AES-256-GCM format
+**The audio** is covered by `AUDIO_KEY` instead, in a chunked lazyxchacha format
 (`src/crypto.rs`, mirrored in `web/src/lib/audio-crypto.ts`, with a test that
 fails if the two ever disagree). The console seals a file before it leaves the
 browser, RustFS only ever stores that ciphertext, and the worker unseals it just
 long enough for demucs to run. Stems are sealed again before they go back up and
 are decrypted in the browser, which is why they stream back through the service
 when a key is set: fetching a presigned URL from JS would need CORS on the
-bucket.
+bucket. Sealing costs 45 bytes per megabyte-sized chunk and nothing else, so
+`MAX_UPLOAD_BYTES` still means what it says.
 
 What this does and does not buy you, plainly:
 

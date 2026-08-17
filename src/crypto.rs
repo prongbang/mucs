@@ -1,60 +1,85 @@
-//! Chunked AES-256-GCM for the audio path.
+//! Chunked XChaCha20-Poly1305 for the audio path, through `lazyxchacha`.
 //!
-//! lazynton covers the JSON API, but its helpers hex-encode the whole body in
-//! memory — fine for a job list, hopeless for a 256 MB upload. So the audio gets
-//! its own framing: a magic header followed by independently sealed chunks, which
-//! streams in constant memory on both ends and maps onto WebCrypto's AES-GCM in
-//! the browser (hardware-accelerated; a JS XChaCha20 implementation is not).
+//! lazynton covers the JSON API and lazyxchacha covers the cipher, but
+//! lazyxchacha seals a whole body at once — fine for a job list, hopeless for a
+//! 256 MB upload. So the audio gets its own framing: a magic header followed by
+//! independently sealed chunks, which streams in constant memory on both ends.
+//!
+//! Both ends use `encrypt_raw`/`decrypt_raw`, so nothing is ever text: the
+//! sealed file is the audio plus 45 bytes per chunk.
 //!
 //! ```text
-//! "mucsE1\0\0"                       8 bytes
+//! "mucsL2\0\0"                       8 bytes
 //! per chunk, repeated:
-//!     u32 BE  ciphertext length      (plaintext len + 16 byte tag)
-//!     nonce                          12 bytes
-//!     ciphertext || tag
+//!     u32 BE  sealed length
+//!     nonce (24) || ciphertext || tag  — exactly what lazyxchacha returns
 //! ```
 //!
-//! Each chunk is sealed with `index (u64 BE) || is_last (u8)` as associated
-//! data, so a reordered, duplicated, dropped or truncated stream fails to
-//! authenticate instead of silently decoding to the wrong audio.
+//! lazyxchacha takes no associated data, so the chunk's position rides *inside*
+//! the sealed plaintext, as `index (u64 BE) || is_last (u8)` ahead of the audio,
+//! and is checked after opening. That keeps the original property: a reordered,
+//! duplicated, dropped or truncated stream fails instead of silently decoding to
+//! the wrong audio.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{bail, Context, Result};
+use lazyxchacha::lazyxchacha::{Cryptography, LazyXChaCha};
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
-pub const MAGIC: &[u8; 8] = b"mucsE1\0\0";
+pub const MAGIC: &[u8; 8] = b"mucsL2\0\0";
 /// Plaintext bytes per chunk. Also the browser's chunk size — both sides must agree.
 pub const CHUNK: usize = 1024 * 1024;
-const NONCE: usize = 12;
+/// `index (u64 BE) || is_last (u8)`, sealed ahead of the audio in place of the
+/// associated data lazyxchacha does not take.
+const HEADER: usize = 9;
+const NONCE: usize = 24;
 const TAG: usize = 16;
+/// Nonce, tag and header: a frame carrying no audio at all is still this long.
+const MIN_FRAME: usize = NONCE + HEADER + TAG;
 /// A chunk can never legitimately exceed this; guards against a corrupt length
 /// header turning into a huge allocation.
-const MAX_FRAME: usize = CHUNK + TAG + 1024;
+const MAX_FRAME: usize = MIN_FRAME + CHUNK;
 
-fn cipher(key_hex: &str) -> Result<Aes256Gcm> {
+/// lazyxchacha slices the key without checking it, so a bad `AUDIO_KEY` has to
+/// be caught here or it panics inside the library. Returns the concrete type
+/// rather than `LazyXChaCha::new()`'s `Arc<dyn Cryptography>`, which is not
+/// `Send` and so cannot cross the worker's `tokio::spawn`.
+fn cipher(key_hex: &str) -> Result<LazyXChaCha> {
     let raw = hex::decode(key_hex).context("audio key is not hex")?;
     if raw.len() != 32 {
         bail!("audio key must be 32 bytes ({} given)", raw.len());
     }
-    Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&raw)))
+    Ok(LazyXChaCha {})
 }
 
-fn aad(index: u64, last: bool) -> [u8; 9] {
-    let mut a = [0u8; 9];
-    a[..8].copy_from_slice(&index.to_be_bytes());
-    a[8] = last as u8;
-    a
+/// The header lazyxchacha's missing associated data is replaced by, prepended to
+/// the audio so the whole thing is sealed as one plaintext.
+fn frame(index: u64, last: bool, plain: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(HEADER + plain.len());
+    framed.extend_from_slice(&index.to_be_bytes());
+    framed.push(last as u8);
+    framed.extend_from_slice(plain);
+    framed
 }
 
-fn nonce_for(index: u64) -> [u8; NONCE] {
-    // Deterministic counter nonce. Safe here because a key never encrypts two
-    // different streams: each object is sealed once, and a re-upload writes a
-    // new object under a new job id.
-    let mut n = [0u8; NONCE];
-    n[4..].copy_from_slice(&index.to_be_bytes());
-    n
+fn unframe(opened: Vec<u8>, index: u64) -> Result<(Vec<u8>, bool)> {
+    if opened.len() < HEADER {
+        bail!("chunk {index} is missing its header");
+    }
+
+    let sealed_index = u64::from_be_bytes(opened[..8].try_into()?);
+    if sealed_index != index {
+        bail!("chunk {index} was sealed as chunk {sealed_index} — the stream is out of order");
+    }
+    let last = match opened[8] {
+        0 => false,
+        1 => true,
+        other => bail!("chunk {index} has a bogus last-flag {other}"),
+    };
+
+    let mut plain = opened;
+    plain.drain(..HEADER);
+    Ok((plain, last))
 }
 
 /// True if `path` starts with the chunked-format magic. Objects written before
@@ -75,8 +100,8 @@ pub async fn encrypt_file(src: &Path, dst: &Path, key_hex: &str) -> Result<()> {
 
     let mut buf = vec![0u8; CHUNK];
     let mut index: u64 = 0;
-    // One chunk of lookahead: the last chunk is sealed with a different AAD, and
-    // we only know a chunk is last once the read after it comes back empty.
+    // One chunk of lookahead: the last chunk carries a different header, and we
+    // only know a chunk is last once the read after it comes back empty.
     let mut pending: Option<Vec<u8>> = None;
 
     loop {
@@ -84,7 +109,7 @@ pub async fn encrypt_file(src: &Path, dst: &Path, key_hex: &str) -> Result<()> {
         let chunk = (n > 0).then(|| buf[..n].to_vec());
 
         if let Some(prev) = pending.take() {
-            write_chunk(&mut writer, &cipher, index, chunk.is_none(), &prev).await?;
+            write_chunk(&mut writer, &cipher, key_hex, index, chunk.is_none(), &prev).await?;
             index += 1;
         }
 
@@ -97,7 +122,7 @@ pub async fn encrypt_file(src: &Path, dst: &Path, key_hex: &str) -> Result<()> {
     // An empty input still gets one (empty) final chunk, so decrypting it is a
     // normal success rather than a truncation error.
     if index == 0 {
-        write_chunk(&mut writer, &cipher, 0, true, &[]).await?;
+        write_chunk(&mut writer, &cipher, key_hex, 0, true, &[]).await?;
     }
 
     writer.flush().await?;
@@ -106,23 +131,19 @@ pub async fn encrypt_file(src: &Path, dst: &Path, key_hex: &str) -> Result<()> {
 
 async fn write_chunk<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
-    cipher: &Aes256Gcm,
+    cipher: &LazyXChaCha,
+    key_hex: &str,
     index: u64,
     last: bool,
     plain: &[u8],
 ) -> Result<()> {
-    let sealed = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce_for(index)),
-            Payload {
-                msg: plain,
-                aad: &aad(index, last),
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("chunk {index} failed to encrypt"))?;
+    // lazyxchacha swallows its errors and returns an empty buffer.
+    let sealed = cipher.encrypt_raw(&frame(index, last, plain), key_hex);
+    if sealed.is_empty() {
+        bail!("chunk {index} failed to encrypt");
+    }
 
     writer.write_all(&(sealed.len() as u32).to_be_bytes()).await?;
-    writer.write_all(&nonce_for(index)).await?;
     writer.write_all(&sealed).await?;
     Ok(())
 }
@@ -152,25 +173,20 @@ pub async fn decrypt_file(src: &Path, dst: &Path, key_hex: &str) -> Result<()> {
         }
 
         let len = u32::from_be_bytes(len) as usize;
-        if len < TAG || len > MAX_FRAME {
+        if !(MIN_FRAME..=MAX_FRAME).contains(&len) {
             bail!("chunk {index} declares an implausible length of {len}");
         }
 
-        let mut nonce = [0u8; NONCE];
-        reader.read_exact(&mut nonce).await?;
         let mut sealed = vec![0u8; len];
         reader.read_exact(&mut sealed).await?;
 
-        // Try "not last" first; a failure there means either this is the final
-        // chunk or the stream has been tampered with — the second attempt tells
-        // the two apart, because only genuine final chunks authenticate.
-        let (plain, last) = match open(&cipher, &nonce, index, false, &sealed) {
-            Some(p) => (p, false),
-            None => match open(&cipher, &nonce, index, true, &sealed) {
-                Some(p) => (p, true),
-                None => bail!("chunk {index} failed to authenticate"),
-            },
-        };
+        // Empty is how lazyxchacha reports a failed open, and a genuine chunk is
+        // never empty — it always carries its 9-byte header.
+        let opened = cipher.decrypt_raw(&sealed, key_hex);
+        if opened.is_empty() {
+            bail!("chunk {index} failed to authenticate");
+        }
+        let (plain, last) = unframe(opened, index)?;
 
         writer.write_all(&plain).await?;
         if last {
@@ -181,24 +197,6 @@ pub async fn decrypt_file(src: &Path, dst: &Path, key_hex: &str) -> Result<()> {
 
     writer.flush().await?;
     Ok(())
-}
-
-fn open(
-    cipher: &Aes256Gcm,
-    nonce: &[u8; NONCE],
-    index: u64,
-    last: bool,
-    sealed: &[u8],
-) -> Option<Vec<u8>> {
-    cipher
-        .decrypt(
-            Nonce::from_slice(nonce),
-            Payload {
-                msg: sealed,
-                aad: &aad(index, last),
-            },
-        )
-        .ok()
 }
 
 /// `read` is allowed to return short reads; a partial chunk would change the
@@ -267,15 +265,20 @@ mod tests {
         // Round trip in both directions: bun seals what Rust opens, and opens
         // what Rust sealed.
         encrypt_file(&dir.join("plain"), &dir.join("rust.enc"), KEY).await?;
+        // `isSealed` is checked here too: the stem player routes every download
+        // through it, so a magic it disagrees with means ciphertext reaches the
+        // audio decoder and the only symptom is "unable to decode audio data".
         let script = format!(
             r#"
-            import {{ encryptFile, decryptBytes }} from {web:?};
+            import {{ encryptFile, decryptBytes, isSealed }} from {web:?};
             const dir = {dir:?};
             const plain = new Blob([await Bun.file(dir + "/plain").arrayBuffer()]);
             const sealed = await encryptFile(plain, {KEY:?});
             await Bun.write(dir + "/bun.enc", sealed);
-            const opened = await decryptBytes(
-                await Bun.file(dir + "/rust.enc").arrayBuffer(), {KEY:?});
+            const fromRust = await Bun.file(dir + "/rust.enc").arrayBuffer();
+            if (!isSealed(fromRust)) throw new Error("isSealed rejected the server's own output");
+            if (isSealed(await plain.arrayBuffer())) throw new Error("isSealed accepted plaintext");
+            const opened = await decryptBytes(fromRust, {KEY:?});
             await Bun.write(dir + "/bun.out", opened);
             "#
         );
@@ -327,6 +330,18 @@ mod tests {
         // Dropping the final chunk must not read as a shorter, valid file.
         tokio::fs::write(&sealed, &good[..good.len() / 2]).await?;
         assert!(decrypt_file(&sealed, &back, KEY).await.is_err(), "truncated");
+
+        // lazyxchacha has no associated data, so ordering rests entirely on the
+        // header sealed inside each chunk. Swap two same-sized frames to prove it.
+        let mut swapped = good.clone();
+        let body = MAGIC.len() + 4;
+        let frame = u32::from_be_bytes(good[MAGIC.len()..body].try_into()?) as usize;
+        let (a, b) = (body, body + frame + 4);
+        for i in 0..frame {
+            swapped.swap(a + i, b + i);
+        }
+        tokio::fs::write(&sealed, &swapped).await?;
+        assert!(decrypt_file(&sealed, &back, KEY).await.is_err(), "reordered");
 
         tokio::fs::write(&sealed, &good).await?;
         let other = "0".repeat(64);

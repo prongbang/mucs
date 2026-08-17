@@ -1,16 +1,9 @@
-import { decryptBytes } from './audio-crypto';
+import { decryptBytes, isSealed } from './audio-crypto';
 
 /// Plays a job's stems as one multitrack: every stem starts on the same
 /// AudioContext clock, so muting `vocals` leaves the rest exactly where it was.
 /// Separate `<audio>` elements drift apart within seconds, which defeats the
 /// point of having separated them.
-
-const SEALED = 'mucsE1';
-
-function isSealed(bytes: ArrayBuffer) {
-	if (bytes.byteLength < SEALED.length) return false;
-	return new TextDecoder().decode(new Uint8Array(bytes, 0, SEALED.length)) === SEALED;
-}
 
 export type Track = {
 	name: string;
